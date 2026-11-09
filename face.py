@@ -24,11 +24,11 @@ MODEL_NAME = "Facenet"
 MATCH_THRESHOLD = 0.40
 POINTS_PER_DROP = 10
 DROP_COOLDOWN_SECONDS = 3.0
-YOLO_FRAME_INTERVAL = 4
+YOLO_FRAME_INTERVAL = 1
+DETECTION_CONFIDENCE = 0.25
 TARGET_CLASSES = {"bottle", "cup", "can"}
 BIN_CLASSES = {"trash can", "recycling bin"}
 YOLO_CLASSES = ("bottle", "cup", "can", "trash can", "recycling bin")
-DROP_ZONE = (200, 300, 440, 480)
 TRACK_MATCH_DISTANCE = 100
 DROP_MIN_DOWNWARD_PIXELS = 15
 DROP_SETTLE_DISTANCE = 12
@@ -214,33 +214,46 @@ def draw_face_box(frame, facial_area, identified):
     cv2.rectangle(frame, (x, y), (x + width, y + height), color, 2)
 
 
-def get_drop_zone(frame):
+def get_drop_zone(frame, bin_detection=None):
+    if bin_detection is None:
+        return None
+
     height, width = frame.shape[:2]
+    x1, y1, x2, y2 = bin_detection["box"]
+    bin_width = x2 - x1
+    bin_height = y2 - y1
     return (
-        min(DROP_ZONE[0], width - 1),
-        min(DROP_ZONE[1], height - 1),
-        min(DROP_ZONE[2], width),
-        min(DROP_ZONE[3], height),
+        max(0, min(width - 1, int(x1 + bin_width * 0.1))),
+        max(0, min(height - 1, y1)),
+        max(1, min(width, int(x2 - bin_width * 0.1))),
+        max(1, min(height, int(y1 + bin_height * 0.35))),
     )
 
 
 def detect_litter(model, frame, drop_zone):
     detections = []
-    x1_zone, y1_zone, x2_zone, y2_zone = drop_zone
-    result = model(frame, verbose=False)[0]
+    result = model(
+        frame, verbose=False, conf=DETECTION_CONFIDENCE
+    )[0]
 
     for box in result.boxes:
         class_id = int(box.cls[0].item())
         label = result.names[class_id]
         if label not in TARGET_CLASSES and label not in BIN_CLASSES:
             continue
-        if float(box.conf[0].item()) < 0.35:
+        if float(box.conf[0].item()) < DETECTION_CONFIDENCE:
             continue
 
         x1, y1, x2, y2 = [int(value) for value in box.xyxy[0].tolist()]
         center_x = (x1 + x2) // 2
         center_y = (y1 + y2) // 2
-        inside = x1_zone <= center_x <= x2_zone and y1_zone <= center_y <= y2_zone
+        inside = False
+        if drop_zone is not None:
+            x1_zone, y1_zone, x2_zone, y2_zone = drop_zone
+            inside = (
+                x1_zone <= center_x <= x2_zone
+                and y1_zone <= center_y <= y2_zone
+            )
         detections.append(
             {
                 "box": (x1, y1, x2, y2),
@@ -252,6 +265,19 @@ def detect_litter(model, frame, drop_zone):
         )
 
     return detections
+
+
+def mark_detections_in_drop_zone(detections, drop_zone):
+    for detection in detections:
+        inside = False
+        if drop_zone is not None:
+            x1_zone, y1_zone, x2_zone, y2_zone = drop_zone
+            center_x, center_y = detection["center"]
+            inside = (
+                x1_zone <= center_x <= x2_zone
+                and y1_zone <= center_y <= y2_zone
+            )
+        detection["inside"] = inside
 
 
 def update_drop_tracks(tracks, detections, drop_zone):
@@ -326,25 +352,62 @@ def update_drop_tracks(tracks, detections, drop_zone):
 
 
 def draw_litter(frame, detections, drop_zone):
-    x1_zone, y1_zone, x2_zone, y2_zone = drop_zone
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x1_zone, y1_zone), (x2_zone, y2_zone), (255, 180, 0), -1)
-    cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
-    for x in range(x1_zone, x2_zone, 24):
-        cv2.line(frame, (x, y1_zone), (min(x + 12, x2_zone), y1_zone), (255, 180, 0), 2)
-        cv2.line(frame, (x, y2_zone), (min(x + 12, x2_zone), y2_zone), (255, 180, 0), 2)
-    for y in range(y1_zone, y2_zone, 24):
-        cv2.line(frame, (x1_zone, y), (x1_zone, min(y + 12, y2_zone)), (255, 180, 0), 2)
-        cv2.line(frame, (x2_zone, y), (x2_zone, min(y + 12, y2_zone)), (255, 180, 0), 2)
-    cv2.putText(
-        frame,
-        "RECYCLING DROP ZONE",
-        (x1_zone, y1_zone - 10),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 180, 0),
-        2,
-    )
+    if drop_zone is None:
+        cv2.putText(
+            frame,
+            "Aim camera at the recycling bin",
+            (20, 190),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2,
+        )
+    else:
+        x1_zone, y1_zone, x2_zone, y2_zone = drop_zone
+        overlay = frame.copy()
+        cv2.rectangle(
+            overlay, (x1_zone, y1_zone), (x2_zone, y2_zone), (255, 180, 0), -1
+        )
+        cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
+        for x in range(x1_zone, x2_zone, 24):
+            cv2.line(
+                frame,
+                (x, y1_zone),
+                (min(x + 12, x2_zone), y1_zone),
+                (255, 180, 0),
+                2,
+            )
+            cv2.line(
+                frame,
+                (x, y2_zone),
+                (min(x + 12, x2_zone), y2_zone),
+                (255, 180, 0),
+                2,
+            )
+        for y in range(y1_zone, y2_zone, 24):
+            cv2.line(
+                frame,
+                (x1_zone, y),
+                (x1_zone, min(y + 12, y2_zone)),
+                (255, 180, 0),
+                2,
+            )
+            cv2.line(
+                frame,
+                (x2_zone, y),
+                (x2_zone, min(y + 12, y2_zone)),
+                (255, 180, 0),
+                2,
+            )
+        cv2.putText(
+            frame,
+            "BIN OPENING - DROP BOTTLE HERE",
+            (x1_zone, max(y1_zone - 10, 20)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 180, 0),
+            2,
+        )
     for detection in detections:
         x1, y1, x2, y2 = detection["box"]
         label = detection["label"]
@@ -384,7 +447,7 @@ def run_webcam():
     facial_area = None
     frame_count = 0
     detections = []
-    drop_zone = get_drop_zone(np.zeros((480, 640, 3), dtype=np.uint8))
+    drop_zone = None
     drop_tracks = {}
     last_award_time = -DROP_COOLDOWN_SECONDS
     banner = ""
@@ -405,16 +468,34 @@ def run_webcam():
                     active_user = status.partition(":")[2].strip()
 
             if frame_count % YOLO_FRAME_INTERVAL == 0:
-                drop_zone = get_drop_zone(frame)
-                detections = detect_litter(litter_model, frame, drop_zone)
+                detections = detect_litter(litter_model, frame, None)
+                bins = [
+                    detection
+                    for detection in detections
+                    if detection["kind"] == "bin"
+                ]
+                bin_detection = next(
+                    (
+                        detection
+                        for detection in bins
+                        if detection["label"] == "recycling bin"
+                    ),
+                    bins[0] if bins else None,
+                )
+                drop_zone = get_drop_zone(frame, bin_detection)
+                mark_detections_in_drop_zone(detections, drop_zone)
                 recyclable_detections = [
                     detection
                     for detection in detections
                     if detection["kind"] == "recyclable"
                 ]
-                drop_ready = update_drop_tracks(
-                    drop_tracks, recyclable_detections, drop_zone
-                )
+                if drop_zone is None:
+                    drop_tracks.clear()
+                    drop_ready = False
+                else:
+                    drop_ready = update_drop_tracks(
+                        drop_tracks, recyclable_detections, drop_zone
+                    )
                 if drop_ready:
                     now = time.monotonic()
                     if active_user and now - last_award_time >= DROP_COOLDOWN_SECONDS:

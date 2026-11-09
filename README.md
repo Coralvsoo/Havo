@@ -4,6 +4,11 @@ Webcam app that recognizes registered users, detects recyclable items and bins,
 and awards points when a recyclable is dropped in the configured drop zone.
 User face embeddings and points are stored in a local SQLite database.
 
+Point the webcam at a recycling bin: the app detects the bin on each frame and
+places the highlighted drop area over its opening. Bottles, cans, and cups are
+then tracked relative to that opening; a recognized bin must remain visible for
+drop tracking and points to work.
+
 ## Requirements
 
 - Python 3.10 or newer
