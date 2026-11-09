@@ -1,0 +1,25 @@
+# Python environments and generated files
+env/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local face data and database (may contain biometric embeddings)
+known_faces/
+marjona.jpg
+smartclean_app.db*
+*.sqlite
+*.sqlite3
+
+# Downloaded model weights
+*.pt
+
+# Local DeepFace source checkout; install the package from requirements.txt
+deepface/
+
+# Local configuration and logs
+.env
+.env.*
+*.log
