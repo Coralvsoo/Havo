@@ -1,5 +1,7 @@
 import argparse
+from contextlib import closing
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -7,8 +9,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 from ultralytics import YOLO
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -19,8 +19,19 @@ if (LOCAL_DEEPFACE_SOURCE / "deepface" / "__init__.py").is_file():
 from deepface import DeepFace
 
 
-DATABASE_PATH = PROJECT_DIR / "smartclean_app.db"
+DATABASE_PATH = Path(
+    os.environ.get("HAVO_DATABASE_PATH", PROJECT_DIR / "smartclean_app.db")
+)
 MODEL_NAME = "Facenet"
+FINE_TUNED_BIN_MODEL_PATHS = (
+    Path.home() / "Downloads" / "P04_bin_dataset2_best.pt",
+    PROJECT_DIR / "P04_bin_dataset2_best.pt",
+    PROJECT_DIR / "weights" / "p04_bin" / "best.pt",
+)
+FINE_TUNED_BIN_MODEL_PATH = next(
+    (path for path in FINE_TUNED_BIN_MODEL_PATHS if path.is_file()),
+    FINE_TUNED_BIN_MODEL_PATHS[-1],
+)
 MATCH_THRESHOLD = 0.40
 POINTS_PER_DROP = 10
 DROP_COOLDOWN_SECONDS = 3.0
@@ -29,6 +40,9 @@ DETECTION_CONFIDENCE = 0.25
 TARGET_CLASSES = {"bottle", "cup", "can"}
 BIN_CLASSES = {"trash can", "recycling bin"}
 YOLO_CLASSES = ("bottle", "cup", "can", "trash can", "recycling bin")
+MODEL_OLD = "old"
+MODEL_FINE_TUNED = "fine_tuned"
+MODEL_COMPARE = "compare"
 TRACK_MATCH_DISTANCE = 100
 DROP_MIN_DOWNWARD_PIXELS = 15
 DROP_SETTLE_DISTANCE = 12
@@ -69,6 +83,28 @@ def extract_embedding(image):
     return np.asarray(representations[0]["embedding"], dtype=np.float32)
 
 
+def save_user_embedding(name, embedding):
+    clean_name = name.strip()
+    if not clean_name:
+        raise ValueError("User name cannot be empty")
+
+    vector_json = json.dumps(np.asarray(embedding, dtype=np.float32).tolist())
+    try:
+        with closing(connect_database()) as connection:
+            connection.execute(
+                """
+                INSERT INTO face_embeddings (user_name, vector_json)
+                VALUES (?, ?)
+                ON CONFLICT(user_name) DO UPDATE SET vector_json = excluded.vector_json
+                """,
+                (clean_name, vector_json),
+            )
+            connection.commit()
+    except sqlite3.Error as error:
+        raise RuntimeError(f"Could not save face embedding: {error}") from error
+    return clean_name
+
+
 def add_user(name, image_path):
     clean_name = name.strip()
     if not clean_name:
@@ -80,25 +116,15 @@ def add_user(name, image_path):
 
     try:
         embedding = extract_embedding(str(source))
-        vector_json = json.dumps(embedding.tolist())
-        with connect_database() as connection:
-            connection.execute(
-                """
-                INSERT INTO face_embeddings (user_name, vector_json)
-                VALUES (?, ?)
-                ON CONFLICT(user_name) DO UPDATE SET vector_json = excluded.vector_json
-                """,
-                (clean_name, vector_json),
-            )
-            connection.commit()
+        save_user_embedding(clean_name, embedding)
         print(f"Registered {clean_name} in {DATABASE_PATH}")
-    except (sqlite3.Error, OSError, ValueError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         raise RuntimeError(f"Could not register {clean_name}: {error}") from error
 
 
 def load_embeddings():
     try:
-        with connect_database() as connection:
+        with closing(connect_database()) as connection:
             rows = connection.execute(
                 "SELECT user_name, vector_json FROM face_embeddings"
             ).fetchall()
@@ -122,7 +148,7 @@ def award_points(user_name):
         return None
 
     try:
-        with connect_database() as connection:
+        with closing(connect_database()) as connection:
             registered = connection.execute(
                 "SELECT 1 FROM face_embeddings WHERE user_name = ?",
                 (user_name,),
@@ -151,7 +177,7 @@ def get_user_points(user_name):
     if not user_name:
         return 0
     try:
-        with connect_database() as connection:
+        with closing(connect_database()) as connection:
             row = connection.execute(
                 "SELECT points FROM user_points WHERE user_name = ?",
                 (user_name,),
@@ -230,39 +256,98 @@ def get_drop_zone(frame, bin_detection=None):
     )
 
 
-def detect_litter(model, frame, drop_zone):
+def select_target_bin(frame):
+    selection = cv2.selectROI(
+        "Select target bin - drag a box and press Enter",
+        frame,
+        showCrosshair=True,
+        fromCenter=False,
+    )
+    x, y, width, height = (int(value) for value in selection)
+    if width <= 0 or height <= 0:
+        raise RuntimeError("No target bin was selected. Restart and select the bin.")
+
+    frame_height, frame_width = frame.shape[:2]
+    x1 = max(0, min(frame_width - 1, x))
+    y1 = max(0, min(frame_height - 1, y))
+    x2 = max(x1 + 1, min(frame_width, x + width))
+    y2 = max(y1 + 1, min(frame_height, y + height))
+    center = ((x1 + x2) // 2, (y1 + y2) // 2)
+    return {
+        "box": (x1, y1, x2, y2),
+        "label": "selected bin",
+        "confidence": 1.0,
+        "kind": "bin",
+        "center": center,
+        "inside": False,
+    }
+
+
+def keep_selected_bin(detections, target_bin):
+    selected_detections = [
+        detection for detection in detections if detection["kind"] == "recyclable"
+    ]
+    selected_detections.append(dict(target_bin))
+    return selected_detections
+
+
+def get_detected_bin(detections):
+    bins = [detection for detection in detections if detection["kind"] == "bin"]
+    return next(
+        (
+            detection
+            for detection in bins
+            if detection["label"] == "recycling bin"
+        ),
+        bins[0] if bins else None,
+    )
+
+
+def detect_litter(model, frame, drop_zone, bin_model=None):
     detections = []
-    result = model(
-        frame, verbose=False, conf=DETECTION_CONFIDENCE
-    )[0]
+    model_classes = [(model, TARGET_CLASSES | BIN_CLASSES)]
+    if bin_model is not None:
+        model_classes = [
+            (model, TARGET_CLASSES),
+            (bin_model, {"bin"} | BIN_CLASSES),
+        ]
 
-    for box in result.boxes:
-        class_id = int(box.cls[0].item())
-        label = result.names[class_id]
-        if label not in TARGET_CLASSES and label not in BIN_CLASSES:
-            continue
-        if float(box.conf[0].item()) < DETECTION_CONFIDENCE:
-            continue
+    for detector, accepted_classes in model_classes:
+        result = detector(
+            frame, verbose=False, conf=DETECTION_CONFIDENCE
+        )[0]
+        for box in result.boxes:
+            class_id = int(box.cls[0].item())
+            label = result.names[class_id]
+            if label not in accepted_classes:
+                continue
+            if float(box.conf[0].item()) < DETECTION_CONFIDENCE:
+                continue
 
-        x1, y1, x2, y2 = [int(value) for value in box.xyxy[0].tolist()]
-        center_x = (x1 + x2) // 2
-        center_y = (y1 + y2) // 2
-        inside = False
-        if drop_zone is not None:
-            x1_zone, y1_zone, x2_zone, y2_zone = drop_zone
-            inside = (
-                x1_zone <= center_x <= x2_zone
-                and y1_zone <= center_y <= y2_zone
+            x1, y1, x2, y2 = [int(value) for value in box.xyxy[0].tolist()]
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+            inside = False
+            if drop_zone is not None:
+                x1_zone, y1_zone, x2_zone, y2_zone = drop_zone
+                inside = (
+                    x1_zone <= center_x <= x2_zone
+                    and y1_zone <= center_y <= y2_zone
+                )
+            detections.append(
+                {
+                    "box": (x1, y1, x2, y2),
+                    "label": label,
+                    "confidence": float(box.conf[0].item()),
+                    "kind": (
+                        "bin"
+                        if label in BIN_CLASSES or label == "bin"
+                        else "recyclable"
+                    ),
+                    "center": (center_x, center_y),
+                    "inside": inside,
+                }
             )
-        detections.append(
-            {
-                "box": (x1, y1, x2, y2),
-                "label": label,
-                "kind": "bin" if label in BIN_CLASSES else "recyclable",
-                "center": (center_x, center_y),
-                "inside": inside,
-            }
-        )
 
     return detections
 
@@ -428,7 +513,47 @@ def draw_litter(frame, detections, drop_zone):
         )
 
 
-def run_webcam():
+def load_litter_models(model_choice):
+    if model_choice == MODEL_FINE_TUNED:
+        if not FINE_TUNED_BIN_MODEL_PATH.is_file():
+            raise FileNotFoundError(
+                "Fine-tuned bin YOLO weights were not found at "
+                f"{FINE_TUNED_BIN_MODEL_PATH}. Train/export the bin-only model first."
+            )
+        bin_model = YOLO(str(FINE_TUNED_BIN_MODEL_PATH))
+        model_names = getattr(bin_model, "names", None)
+        if isinstance(model_names, dict):
+            trained_classes = set(model_names.values())
+        elif isinstance(model_names, (list, tuple)):
+            trained_classes = set(model_names)
+        else:
+            raise RuntimeError(
+                "Could not read the class names stored in the fine-tuned bin checkpoint."
+            )
+        if "bin" not in trained_classes:
+            raise RuntimeError(
+                "The bin-only checkpoint must contain a class named 'bin'. It contains: "
+                f"{', '.join(sorted(trained_classes))}. Retrain from the Roboflow "
+                "bin dataset and export the bin-only best.pt."
+            )
+        item_model = YOLO("yolov8s-world.pt")
+        item_model.set_classes(sorted(TARGET_CLASSES))
+        print(
+            "Using pretrained YOLO-World for recyclable items and fine-tuned "
+            f"YOLOv8 for bins: {FINE_TUNED_BIN_MODEL_PATH}"
+        )
+        return item_model, bin_model
+
+    if model_choice == MODEL_OLD:
+        model = YOLO("yolov8s-world.pt")
+        model.set_classes(list(YOLO_CLASSES))
+        print("Using pretrained YOLO-World")
+        return model, None
+
+    raise ValueError(f"Unknown detector selection: {model_choice}")
+
+
+def run_webcam(model_choice):
     known_embeddings = load_embeddings()
     if not known_embeddings:
         raise RuntimeError(
@@ -440,8 +565,7 @@ def run_webcam():
     if not camera.isOpened():
         raise RuntimeError("Could not open the webcam")
 
-    litter_model = YOLO("yolov8s-world.pt")
-    litter_model.set_classes(list(YOLO_CLASSES))
+    litter_model, bin_model = load_litter_models(model_choice)
     status = "Loading face model..."
     distance = None
     facial_area = None
@@ -456,6 +580,13 @@ def run_webcam():
     active_user = None
 
     try:
+        target_bin = None
+        if model_choice == MODEL_FINE_TUNED:
+            success, selection_frame = camera.read()
+            if not success:
+                raise RuntimeError("Could not read a frame to select the target bin")
+            target_bin = select_target_bin(selection_frame)
+
         while True:
             success, frame = camera.read()
             if not success:
@@ -468,20 +599,15 @@ def run_webcam():
                     active_user = status.partition(":")[2].strip()
 
             if frame_count % YOLO_FRAME_INTERVAL == 0:
-                detections = detect_litter(litter_model, frame, None)
-                bins = [
-                    detection
-                    for detection in detections
-                    if detection["kind"] == "bin"
-                ]
-                bin_detection = next(
-                    (
-                        detection
-                        for detection in bins
-                        if detection["label"] == "recycling bin"
-                    ),
-                    bins[0] if bins else None,
+                model_detections = detect_litter(
+                    litter_model, frame, None, bin_model=bin_model
                 )
+                if target_bin is None:
+                    detections = model_detections
+                    bin_detection = get_detected_bin(detections)
+                else:
+                    detections = keep_selected_bin(model_detections, target_bin)
+                    bin_detection = target_bin
                 drop_zone = get_drop_zone(frame, bin_detection)
                 mark_detections_in_drop_zone(detections, drop_zone)
                 recyclable_detections = [
@@ -561,14 +687,184 @@ def run_webcam():
         cv2.destroyAllWindows()
 
 
+def run_model_comparison_webcam():
+    if not FINE_TUNED_BIN_MODEL_PATH.is_file():
+        raise FileNotFoundError(
+            "Fine-tuned bin YOLO weights were not found at "
+            f"{FINE_TUNED_BIN_MODEL_PATH}. Train/export the bin-only model first."
+        )
+
+    known_embeddings = load_embeddings()
+    if not known_embeddings:
+        raise RuntimeError(
+            "No users registered. Register someone in the startup window or use "
+            "python face.py --add-user Name image.jpg"
+        )
+
+    old_item_model, old_bin_model = load_litter_models(MODEL_OLD)
+    new_item_model, new_bin_model = load_litter_models(MODEL_FINE_TUNED)
+    camera = cv2.VideoCapture(0)
+    if not camera.isOpened():
+        raise RuntimeError("Could not open the webcam")
+
+    fine_tuned_name = "YOLO-World items + YOLOv8 bin"
+    latencies = {"YOLO-World (old)": [], fine_tuned_name: []}
+    bin_frames = {"YOLO-World (old)": 0, fine_tuned_name: 0}
+    frame_count = 0
+    warmed_up = False
+    face_status = "Loading face model..."
+    face_distance = None
+    facial_area = None
+    try:
+        success, selection_frame = camera.read()
+        if not success:
+            raise RuntimeError("Could not read a frame to select the target bin")
+        target_bin = select_target_bin(selection_frame)
+
+        while True:
+            success, frame = camera.read()
+            if not success:
+                raise RuntimeError("Could not read a frame from the webcam")
+            if not warmed_up:
+                old_item_model(frame, verbose=False, conf=DETECTION_CONFIDENCE)
+                new_item_model(frame, verbose=False, conf=DETECTION_CONFIDENCE)
+                new_bin_model(frame, verbose=False, conf=DETECTION_CONFIDENCE)
+                warmed_up = True
+            frame_count += 1
+            if frame_count % 10 == 0:
+                face_status, face_distance, facial_area = recognize_frame(
+                    frame, known_embeddings
+                )
+
+            model_pairs = [
+                ("YOLO-World (old)", old_item_model, old_bin_model),
+                (
+                    "YOLO-World items + YOLOv8 bin",
+                    new_item_model,
+                    new_bin_model,
+                ),
+            ]
+            if frame_count % 2 == 0:
+                model_pairs.reverse()
+
+            results = {}
+            for model_name, item_model, bin_model in model_pairs:
+                started = time.perf_counter()
+                model_detections = detect_litter(
+                    item_model, frame, None, bin_model=bin_model
+                )
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                bin_detections = [
+                    detection for detection in model_detections
+                    if detection["kind"] == "bin"
+                ]
+                latencies[model_name].append(elapsed_ms)
+                if bin_detections:
+                    bin_frames[model_name] += 1
+                detections = keep_selected_bin(model_detections, target_bin)
+                results[model_name] = (detections, elapsed_ms, bin_detections)
+
+            panels = []
+            for model_name in (
+                "YOLO-World (old)",
+                "YOLO-World items + YOLOv8 bin",
+            ):
+                detections, elapsed_ms, bin_detections = results[model_name]
+                panel = frame.copy()
+                panel_detections = [dict(detection) for detection in detections]
+                drop_zone = get_drop_zone(frame, target_bin)
+                mark_detections_in_drop_zone(panel_detections, drop_zone)
+                draw_litter(panel, panel_detections, drop_zone)
+                identified = face_status.startswith("Identified:")
+                draw_face_box(panel, facial_area, identified)
+                bin_status = f"Selected bin | model bin boxes: {len(bin_detections)}"
+                cv2.rectangle(panel, (0, 0), (panel.shape[1], 100), (30, 30, 30), -1)
+                cv2.putText(
+                    panel,
+                    f"{model_name} | inference: {elapsed_ms:.1f} ms",
+                    (12, 27),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.62,
+                    (255, 255, 255),
+                    2,
+                )
+                cv2.putText(
+                    panel,
+                    bin_status,
+                    (12, 54),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.62,
+                    (0, 255, 0),
+                    2,
+                )
+                display_face_status = f"Face: {face_status}"
+                if face_distance is not None:
+                    display_face_status += f" ({face_distance:.3f})"
+                cv2.putText(
+                    panel,
+                    display_face_status,
+                    (12, 88),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.62,
+                    (0, 255, 0) if identified else (0, 0, 255),
+                    2,
+                )
+                panels.append(panel)
+
+            comparison = cv2.hconcat(panels)
+            cv2.putText(
+                comparison,
+                "Same camera frame | Q or Esc to finish and show timing summary",
+                (12, comparison.shape[0] - 14),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                (255, 255, 255),
+                2,
+            )
+            cv2.imshow("Live YOLO detector comparison", comparison)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                break
+    finally:
+        camera.release()
+        cv2.destroyAllWindows()
+
+    print("\nLive comparison summary")
+    print(f"Frames compared: {frame_count}")
+    for model_name in (
+        "YOLO-World (old)",
+        fine_tuned_name,
+    ):
+        samples = latencies[model_name]
+        if not samples:
+            continue
+        detection_rate = 100 * bin_frames[model_name] / len(samples)
+        print(
+            f"{model_name}: mean {np.mean(samples):.1f} ms, "
+            f"median {np.median(samples):.1f} ms, "
+            f"p95 {np.percentile(samples, 95):.1f} ms; "
+            f"bin detected in {bin_frames[model_name]}/{len(samples)} frames "
+            f"({detection_rate:.1f}%)"
+        )
+    print(
+        "Bin detection rate is only the fraction of frames with a detection, "
+        "not accuracy; check the video for false positives and missed bins."
+    )
+
+
 def show_registration_window():
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
     root = tk.Tk()
     root.title("Register a person")
     root.resizable(False, False)
 
     name = tk.StringVar()
     image_path = tk.StringVar()
-    start_recognition = False
+    start_requested = False
+    selected_model = None
+    model_choice = tk.StringVar(value=MODEL_OLD)
 
     content = ttk.Frame(root, padding=16)
     content.grid(sticky="nsew")
@@ -602,6 +898,28 @@ def show_registration_window():
     status = ttk.Label(content, text="Choose a clear photo with one visible face.")
     status.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 12))
 
+    ttk.Label(content, text="Object detector").grid(
+        row=3, column=0, columnspan=3, sticky="w", pady=(4, 2)
+    )
+    detector_options = (
+        ("Pretrained YOLO-World (old)", MODEL_OLD),
+        ("YOLO-World items + fine-tuned YOLOv8 bin", MODEL_FINE_TUNED),
+        ("Compare both side by side", MODEL_COMPARE),
+    )
+    for row, (label, value) in enumerate(detector_options, start=4):
+        ttk.Radiobutton(
+            content, text=label, variable=model_choice, value=value
+        ).grid(row=row, column=0, columnspan=3, sticky="w")
+    ttk.Label(
+        content,
+        text=(
+            "Pretrained mode detects bins automatically and awards points. "
+            "Fine-tuned and comparison modes ask you to select a bin. "
+            f"Fine-tuned weights: {FINE_TUNED_BIN_MODEL_PATH}"
+        ),
+        wraplength=430,
+    ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 8))
+
     def register_person():
         clean_name = name.get().strip()
         selected_path = image_path.get().strip()
@@ -634,20 +952,32 @@ def show_registration_window():
     register_button = ttk.Button(
         content, text="Register person", command=register_person
     )
-    register_button.grid(row=3, column=0, sticky="ew", padx=(0, 6))
+    register_button.grid(row=8, column=0, sticky="ew", padx=(0, 6))
 
     def continue_to_recognition():
-        nonlocal start_recognition
-        start_recognition = True
+        nonlocal selected_model, start_requested
+        if (
+            model_choice.get() in {MODEL_FINE_TUNED, MODEL_COMPARE}
+            and not FINE_TUNED_BIN_MODEL_PATH.is_file()
+        ):
+            messagebox.showerror(
+                "Fine-tuned model not found",
+                "Train/export the fine-tuned YOLO model and place it at:\n"
+                f"{FINE_TUNED_BIN_MODEL_PATH}",
+                parent=root,
+            )
+            return
+        selected_model = model_choice.get()
+        start_requested = True
         root.destroy()
 
     ttk.Button(
         content, text="Start webcam", command=continue_to_recognition
-    ).grid(row=3, column=1, columnspan=2, sticky="ew", padx=(6, 0))
+    ).grid(row=8, column=1, columnspan=2, sticky="ew", padx=(6, 0))
 
     name_entry.focus_set()
     root.mainloop()
-    return start_recognition
+    return selected_model if start_requested else None
 
 
 def main():
@@ -659,8 +989,11 @@ def main():
         if args.add_user:
             add_user(*args.add_user)
         else:
-            if show_registration_window():
-                run_webcam()
+            model_choice = show_registration_window()
+            if model_choice == MODEL_COMPARE:
+                run_model_comparison_webcam()
+            elif model_choice in {MODEL_OLD, MODEL_FINE_TUNED}:
+                run_webcam(model_choice)
     except (FileNotFoundError, RuntimeError, ValueError) as error:
         parser.error(str(error))
 

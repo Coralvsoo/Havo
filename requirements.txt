@@ -1,3 +1,7 @@
 deepface
 ultralytics
 pyserial
+fastapi
+uvicorn
+python-multipart
+httpx
