@@ -51,6 +51,8 @@ DRIFT_CONSECUTIVE_CHECKS = 3
 BIN_TRACK_MIN_IOU = 0.1
 BIN_TRACK_CENTER_DISTANCE_RATIO = 0.75
 FACE_RECOGNITION_INTERVAL = 10
+FACE_HOLD_SECONDS = 3.0
+FACE_MAX_MISSES = 3
 ZONE_LOCK = "lock"
 ZONE_DETECT = "detect"
 ZONE_FIXED = "fixed"
@@ -257,6 +259,33 @@ def recognize_frame(frame, known_embeddings):
 
         traceback.print_exc()
         return "Scanning error", None, None
+
+
+def new_identity_state():
+    return {"user": None, "last_seen": None, "misses": 0}
+
+
+def update_identity(state, status, now, distance=None):
+    if status.startswith("Identified:"):
+        state["user"] = status.partition(":")[2].strip()
+        state["last_seen"] = now
+        state["misses"] = 0
+    elif status == "Unknown User" and distance is not None:
+        state.update(new_identity_state())
+    elif state["user"] is not None:
+        state["misses"] += 1
+        if state["misses"] >= FACE_MAX_MISSES:
+            state.update(new_identity_state())
+    return expire_identity(state, now)
+
+
+def expire_identity(state, now):
+    if (
+        state["user"] is not None
+        and now - state["last_seen"] > FACE_HOLD_SECONDS
+    ):
+        state.update(new_identity_state())
+    return state
 
 
 def draw_face_box(frame, facial_area, identified):
@@ -1116,10 +1145,7 @@ def run_session(
         detections = []
         drop_tracks = {}
         recent_above_detections = []
-        active_user_last_seen = None
-        identity_freshness_seconds = max(
-            1.0, 2 * FACE_RECOGNITION_INTERVAL / fps
-        )
+        identity = new_identity_state()
         last_award_time = -DROP_COOLDOWN_SECONDS
         banner = ""
         banner_until = 0.0
@@ -1134,22 +1160,16 @@ def run_session(
                 status, distance, facial_area = recognize_frame(
                     frame, known_embeddings
                 )
-                if status.startswith("Identified:"):
-                    active_user = status.partition(":")[2].strip()
-                    active_user_last_seen = loop_time
-                else:
-                    active_user = None
-                    active_user_last_seen = None
-            if (
-                active_user_last_seen is None
-                or loop_time - active_user_last_seen > identity_freshness_seconds
-            ):
-                active_user = None
-                active_user_last_seen = None
-                if status.startswith("Identified:"):
-                    status = "Unknown User"
-                    distance = None
-                    facial_area = None
+                identity = update_identity(identity, status, loop_time, distance)
+            identity = expire_identity(identity, loop_time)
+            active_user = identity["user"]
+            if active_user and not status.startswith("Identified:"):
+                status = f"Identified: {active_user} (held)"
+                distance = None
+            elif not active_user and status.startswith("Identified:"):
+                status = "Unknown User"
+                distance = None
+                facial_area = None
 
             inside_items = []
             if frame_count % YOLO_FRAME_INTERVAL == 0:
