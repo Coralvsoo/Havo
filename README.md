@@ -4,10 +4,14 @@ Webcam app that recognizes registered users, detects recyclable items and bins,
 and awards points when a recyclable is dropped in the configured drop zone.
 User face embeddings and points are stored in a local SQLite database.
 
-In pretrained YOLO-World mode, the app automatically detects trash cans and
-recycling bins, recognizes registered faces, and awards points when recyclable
-items are dropped into the detected bin's opening. Fine-tuned and comparison
-modes ask you to select a target bin at webcam startup.
+The webcam app recognizes registered faces and recyclable items. Its default
+`lock` zone mode calibrates a bin at startup and keeps the drop zone fixed;
+`detect` follows a bin detector on every frame, while `fixed` asks you to
+manually select the target bin. Points are based on a recyclable moving into
+the on-screen drop zone and then either settling or disappearing for four
+consecutive frames. The zone extends from 0.20 bin heights above the bin's top
+to 0.40 bin heights below it, with a 5% side inset. This is not independent
+proof that the item physically landed in the bin.
 
 ## Requirements
 
@@ -51,11 +55,43 @@ register a user from a local image:
 python face.py --add-user Name path\to\face.jpg
 ```
 
-In fine-tuned or comparison mode, the webcam asks you to select the target bin
-for that run. Drag a rectangle around the bin and press Enter; press Esc to
-cancel. Only that selected bin is used to position the drop zone. The pretrained
-YOLO-World mode does not ask for selection; it automatically prefers a detected
-recycling bin, then falls back to a detected trash can.
+In default `lock` mode, the app samples 30 frames, accepts a stable bin
+detection, and asks you to confirm the proposed box. Press Enter or Space to
+accept, R to redraw, or Esc to select manually. If automatic calibration is
+unstable or misses the bin, select it manually. The zone then stays fixed while
+the bin is covered; after repeated drift checks, the app pauses point awards
+until you press C to recalibrate. `detect` recalculates the zone from the bin
+detection every frame. `fixed` manually selects a bin once and does not run the
+bin detector during the session.
+
+Run with a video file, skip face recognition, or turn on session recording:
+
+```powershell
+python face.py --video path\to\test.mp4 --no-face --no-confirm
+python face.py --record
+python face.py --zone-mode detect --sensor serial:COM3 --record
+```
+
+`--record` creates a timestamped folder under `sessions\` with blurred camera
+segments, event clips and CSV/JSON metadata. Face blurring is enabled unless
+`--no-blur` is specified. `--max-storage-gb` limits storage by removing the
+oldest segments while preserving clips and metadata. `--sensor mock` selects a
+test source; `--sensor serial:PORT` connects to the ESP32 serial sensor. When a
+sensor is connected, its events are the independent ground truth for the live
+drop self-check. Without a sensor, use the saved clips for human review.
+
+Review clips and compare all three zone modes against sensor events or human
+labels:
+
+```powershell
+python scripts\review_session.py sessions\<timestamp>
+python scripts\evaluate_session.py sessions\<timestamp>
+python scripts\evaluate_session.py --sessions sessions\run1 sessions\run2
+```
+
+The review window loops each event clip. Press Y if a real drop happened, N if
+not, S to leave it unlabeled, or B to revisit the previous clip. For a
+`zone_activity` clip, Y means the app missed a real drop.
 
 The first webcam run may download the YOLO-World model weights. A working
 internet connection is required for that initial download.
@@ -118,12 +154,11 @@ metrics.
 
 After running the second-dataset notebook, it exports
 `P04_bin_dataset2_best.pt`. Keep this separate while comparing it with the
-first-dataset model. The app looks for the checkpoint in
-`Downloads\P04_bin_dataset2_best.pt`, the project root as
-`P04_bin_dataset2_best.pt`, then `weights\p04_bin\best.pt`. It combines the
-selected bin detector with pretrained YOLO-World item detection. If no
-fine-tuned checkpoint is available, the old YOLO-World model remains available
-for both items and bins.
+first-dataset model. The app looks for the checkpoint in the project root as
+`P04_bin_dataset2_best.pt`, then `Downloads\P04_bin_dataset2_best.pt`, then
+`weights\p04_bin\best.pt`. Fine-tuned mode combines this bin detector with
+pretrained YOLO-World item detection. The pretrained-only selection remains
+available for items and bins.
 
 ## Local privacy
 
