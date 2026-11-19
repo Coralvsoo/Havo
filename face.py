@@ -22,6 +22,13 @@ from deepface import DeepFace
 from hardware.esp32_serial import SerialSensorSource
 from hardware.mock_sensor import MockSensorSource
 from session_recording import SessionRecorder
+from trial_protocol import (
+    DEFAULT_PLAN,
+    TRIAL_SECONDS,
+    TrialRunner,
+    draw_trial_panel,
+    load_plan,
+)
 from screen_recording import ScreenRecorder, draw_recording_indicator
 
 
@@ -979,8 +986,16 @@ def run_session(
     max_storage_bytes=int(DEFAULT_MAX_STORAGE_GB * 1024**3),
     blur=True,
     sensor=None,
+    trial_plan=None,
+    trial_directory="trials",
+    trial_seconds=TRIAL_SECONDS,
 ):
     """Run a live (or video-file) session.
+
+    Trial mode (trial_plan given): the window shows one planned action at a
+    time. SPACE starts a trial, N cancels or redoes one, and each trial is
+    written as a labelled row (ground truth from the plan, system output
+    observed live) to a CSV file in trial_directory.
 
     Screen recording is opt-in. Pass a directory to start it automatically;
     otherwise press V during the session to toggle recording.
@@ -1017,6 +1032,16 @@ def run_session(
         "yolo-world" if model_choice == MODEL_OLD else "fine-tuned",
     )
     screen_autostart_pending = screen_record_directory is not None
+    model_label = "yolo-world" if model_choice == MODEL_OLD else "fine-tuned"
+    trial_runner = (
+        TrialRunner(
+            trial_plan, trial_directory, model_label, trial_seconds=trial_seconds
+        )
+        if trial_plan
+        else None
+    )
+    if trial_runner is not None:
+        print(f"Trial results: {trial_runner.path}")
 
     try:
         if sensor is not None:
@@ -1297,6 +1322,8 @@ def run_session(
                 if drop_ready:
                     detected_drop_times.append(frame_info["time_sec"])
                     screen_recorder.log_event("drop_detected", active_user)
+                    if trial_runner is not None:
+                        trial_runner.on_drop()
                     record_event(
                         "drop_detected",
                         frame_info,
@@ -1317,6 +1344,8 @@ def run_session(
                         screen_recorder.log_event(
                             "points_awarded", active_user, f"total={user_points}"
                         )
+                        if trial_runner is not None:
+                            trial_runner.on_points()
                         banner = "RECYCLABLE DROPPED: +10 Points Awarded!"
                         banner_until = loop_time + 3.0
                         last_award_time = loop_time
@@ -1418,6 +1447,22 @@ def run_session(
                 (255, 255, 255),
                 1,
             )
+            if trial_runner is not None:
+                trial_runner.observe_frame(active_user is not None)
+                finished = trial_runner.update()
+                if finished is not None:
+                    screen_recorder.log_event(
+                        "trial_end",
+                        active_user,
+                        f"trial={finished['trial']} drop_seen={finished['drop_detected']} "
+                        f"points={finished['points_awarded']}",
+                    )
+                    print(
+                        f"Trial {finished['trial']}: real drop={finished['real_drop']}, "
+                        f"drop seen={finished['drop_detected']}, "
+                        f"points={finished['points_awarded']}"
+                    )
+                draw_trial_panel(display_frame, trial_runner)
             if screen_autostart_pending:
                 screen_autostart_pending = False
                 screen_recorder.start(display_frame.shape[1::-1])
@@ -1429,6 +1474,16 @@ def run_session(
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
+            if trial_runner is not None and key == ord(" "):
+                if trial_runner.start_trial(screen_recorder.elapsed()):
+                    screen_recorder.log_event(
+                        "trial_start",
+                        active_user,
+                        f"trial={trial_runner.current['trial']}",
+                    )
+            if trial_runner is not None and key in (ord("n"), ord("N")):
+                if trial_runner.redo():
+                    screen_recorder.log_event("trial_redo", active_user)
             if key in (ord("v"), ord("V")):
                 if screen_recorder.toggle(display_frame.shape[1::-1]):
                     print(f"Screen recording started: {screen_recorder.video_path}")
@@ -1485,6 +1540,11 @@ def run_session(
                 break
             frame, frame_info = next_frame
     finally:
+        if trial_runner is not None:
+            print(
+                f"Trial results saved: {trial_runner.path} "
+                f"({trial_runner.index} of {len(trial_runner.plan)} trials)"
+            )
         saved_screen_video = screen_recorder.stop()
         if saved_screen_video is not None:
             print(f"Screen recording saved: {saved_screen_video}")
@@ -1885,6 +1945,20 @@ def main():
         metavar="DIR",
         help="Record the annotated window from the start (V toggles during the session)",
     )
+    parser.add_argument(
+        "--trials",
+        nargs="?",
+        const="default",
+        metavar="PLAN_CSV",
+        help="Run scripted trials and log one labelled row per trial "
+        "(default plan: 30 trials; or a CSV with action,item,real_drop)",
+    )
+    parser.add_argument(
+        "--trial-seconds",
+        type=float,
+        default=TRIAL_SECONDS,
+        help="Length of each trial window in seconds",
+    )
     args = parser.parse_args()
 
     try:
@@ -1904,6 +1978,14 @@ def main():
                     parser.error("Serial sensor port cannot be empty")
                 sensor = SerialSensorSource(port)
 
+            if args.trial_seconds <= 0:
+                parser.error("--trial-seconds must be greater than zero")
+            trial_plan = None
+            if args.trials == "default":
+                trial_plan = DEFAULT_PLAN
+            elif args.trials:
+                trial_plan = load_plan(args.trials)
+
             if args.video:
                 model_choice = MODEL_FINE_TUNED
             else:
@@ -1913,6 +1995,7 @@ def main():
                 if (
                     args.record
                     or args.record_screen
+                    or args.trials
                     or args.sensor
                     or args.no_blur
                 ):
@@ -1927,6 +2010,8 @@ def main():
                     video_path=args.video,
                     record_directory=args.record,
                     screen_record_directory=args.record_screen,
+                    trial_plan=trial_plan,
+                    trial_seconds=args.trial_seconds,
                     max_storage_bytes=int(args.max_storage_gb * 1024**3),
                     blur=not args.no_blur,
                     sensor=sensor,
