@@ -46,9 +46,11 @@ BIN_CONFIDENCE = 0.49
 CALIBRATION_FRAMES = 30
 CALIBRATION_MIN_HITS = 20
 CALIBRATION_MIN_IOU = 0.70
-DRIFT_CHECK_SECONDS = 5.0
 DRIFT_IOU_THRESHOLD = 0.50
 DRIFT_CONSECUTIVE_CHECKS = 3
+BIN_TRACK_MIN_IOU = 0.1
+BIN_TRACK_CENTER_DISTANCE_RATIO = 0.75
+FACE_RECOGNITION_INTERVAL = 10
 ZONE_LOCK = "lock"
 ZONE_DETECT = "detect"
 ZONE_FIXED = "fixed"
@@ -345,6 +347,42 @@ def update_drift(state, iou_or_none):
     }
 
 
+def match_bin_detection(detections, reference_box):
+    if not detections or reference_box is None:
+        return None
+
+    x1, y1, x2, y2 = reference_box
+    reference_center = ((x1 + x2) / 2, (y1 + y2) / 2)
+    max_center_distance = max(
+        1, (y2 - y1) * BIN_TRACK_CENTER_DISTANCE_RATIO
+    )
+    matches = []
+    for detection in detections:
+        detection_box = detection["box"]
+        center = detection.get("center")
+        if center is None:
+            dx1, dy1, dx2, dy2 = detection_box
+            center = ((dx1 + dx2) / 2, (dy1 + dy2) / 2)
+        iou = box_iou(reference_box, detection_box)
+        distance = np.hypot(
+            center[0] - reference_center[0],
+            center[1] - reference_center[1],
+        )
+        if (
+            iou >= BIN_TRACK_MIN_IOU
+            or distance <= max_center_distance
+        ):
+            matches.append(
+                (
+                    iou,
+                    -distance,
+                    float(detection.get("confidence", 0.0)),
+                    detection,
+                )
+            )
+    return max(matches, default=(None, None, None, None))[-1]
+
+
 def _run_detector(detector, frame, confidence):
     result = detector(frame, verbose=False, conf=confidence)[0]
     detections = []
@@ -509,20 +547,7 @@ def calibrate_bin(
     return calibrated_box, reason, last_frame, last_frame_info
 
 
-def confirm_bin(camera, frame, box, no_confirm=False, frame_provider=None):
-    if no_confirm:
-        return {
-            "box": tuple(box),
-            "label": "calibrated bin",
-            "confidence": 1.0,
-            "kind": "bin",
-            "center": (
-                (box[0] + box[2]) // 2,
-                (box[1] + box[3]) // 2,
-            ),
-            "inside": False,
-        }
-
+def confirm_bin(camera, frame, box, frame_provider=None):
     window_name = "Confirm calibrated bin"
     cv2.namedWindow(window_name)
     try:
@@ -918,8 +943,6 @@ def run_session(
     model_choice=MODEL_OLD,
     *,
     zone_mode=ZONE_LOCK,
-    no_confirm=False,
-    no_face=False,
     video_path=None,
     record_directory=None,
     max_storage_bytes=int(DEFAULT_MAX_STORAGE_GB * 1024**3),
@@ -928,10 +951,10 @@ def run_session(
 ):
     if zone_mode not in {ZONE_LOCK, ZONE_DETECT, ZONE_FIXED}:
         raise ValueError(f"Unknown zone mode: {zone_mode}")
-    known_embeddings = [] if no_face else load_embeddings()
-    if not no_face and not known_embeddings:
+    known_embeddings = load_embeddings()
+    if not known_embeddings:
         raise RuntimeError(
-            "No users registered. Register someone in the startup window or use "
+            "Face recognition is required. Register someone in the startup window or use "
             "python face.py --add-user Name image.jpg"
         )
 
@@ -1027,7 +1050,6 @@ def run_session(
         frame = first_frame
         target_bin = None
         drift_state = {"bad_checks": 0, "drifted": False}
-        next_drift_check = time.monotonic() + DRIFT_CHECK_SECONDS
         if zone_mode == ZONE_FIXED:
             try:
                 target_bin = select_target_bin(
@@ -1069,7 +1091,6 @@ def run_session(
                     camera,
                     calibration_frame,
                     calibrated_box,
-                    no_confirm=no_confirm,
                     frame_provider=read_next_frame,
                 )
             calibrated_box = target_bin["box"]
@@ -1089,19 +1110,19 @@ def run_session(
                 json.dumps(session_metadata, indent=2), encoding="utf-8"
             )
 
-        status = "Face recognition disabled" if no_face else "Loading face model..."
+        status = "Loading face model..."
         distance = None
         facial_area = None
         detections = []
         drop_tracks = {}
         recent_above_detections = []
-        last_award_time = -DROP_COOLDOWN_SECONDS
-        banner = (
-            "Self-check: no sensor - review clips after the session"
-            if sensor is None
-            else ""
+        active_user_last_seen = None
+        identity_freshness_seconds = max(
+            1.0, 2 * FACE_RECOGNITION_INTERVAL / fps
         )
-        banner_until = float("inf") if sensor is None else 0.0
+        last_award_time = -DROP_COOLDOWN_SECONDS
+        banner = ""
+        banner_until = 0.0
         user_points = 0
         active_user = None
         zone_activity_started = None
@@ -1109,12 +1130,26 @@ def run_session(
 
         while frame is not None:
             loop_time = time.monotonic()
-            if not no_face and frame_count % 10 == 0:
+            if frame_count % FACE_RECOGNITION_INTERVAL == 0:
                 status, distance, facial_area = recognize_frame(
                     frame, known_embeddings
                 )
                 if status.startswith("Identified:"):
                     active_user = status.partition(":")[2].strip()
+                    active_user_last_seen = loop_time
+                else:
+                    active_user = None
+                    active_user_last_seen = None
+            if (
+                active_user_last_seen is None
+                or loop_time - active_user_last_seen > identity_freshness_seconds
+            ):
+                active_user = None
+                active_user_last_seen = None
+                if status.startswith("Identified:"):
+                    status = "Unknown User"
+                    distance = None
+                    facial_area = None
 
             inside_items = []
             if frame_count % YOLO_FRAME_INTERVAL == 0:
@@ -1138,6 +1173,43 @@ def run_session(
                         litter_model, frame, drop_zone
                     )
                     detections = item_detections + bin_detections
+                elif (
+                    zone_mode == ZONE_LOCK
+                    and target_bin["label"] == "selected bin"
+                ):
+                    bin_height = calibrated_box[3] - calibrated_box[1]
+                    item_detections = detect_items(
+                        litter_model, frame, drop_zone
+                    )
+                    detections = item_detections + [dict(target_bin)]
+                elif zone_mode == ZONE_LOCK:
+                    bin_detections = detect_bins(
+                        bin_detector, frame, BIN_CONFIDENCE
+                    )
+                    bin_detection = match_bin_detection(
+                        bin_detections, calibrated_box
+                    )
+                    previous_drift = drift_state["drifted"]
+                    drift_state = update_drift(
+                        drift_state, 1.0 if bin_detection is not None else None
+                    )
+                    if bin_detection is not None and not previous_drift:
+                        target_bin = dict(bin_detection)
+                        calibrated_box = target_bin["box"]
+                        drop_zone = get_drop_zone(frame, target_bin)
+                    if drift_state["drifted"] and not previous_drift:
+                        banner = "Bin moved - press C to recalibrate"
+                        banner_until = float("inf")
+                        record_event(
+                            "drift_detected", frame_info, drop_zone, active_user
+                        )
+                        drop_tracks.clear()
+                        recent_above_detections.clear()
+                    bin_height = calibrated_box[3] - calibrated_box[1]
+                    item_detections = detect_items(
+                        litter_model, frame, drop_zone
+                    )
+                    detections = item_detections + [dict(target_bin)]
                 elif drop_zone is not None:
                     bin_height = target_bin["box"][3] - target_bin["box"][1]
                     item_detections = detect_items(
@@ -1213,39 +1285,6 @@ def run_session(
                         banner_until = loop_time + 3.0
                         last_award_time = loop_time
 
-            if (
-                zone_mode == ZONE_LOCK
-                and not drift_state["drifted"]
-                and loop_time >= next_drift_check
-                and not any(track["drop_candidate"] for track in drop_tracks.values())
-                and not inside_items
-            ):
-                drift_detections = detect_bins(
-                    bin_detector, frame, BIN_CONFIDENCE
-                )
-                best_drift_box = (
-                    max(
-                        drift_detections,
-                        key=lambda detection: detection["confidence"],
-                    )["box"]
-                    if drift_detections
-                    else None
-                )
-                drift_iou = (
-                    box_iou(calibrated_box, best_drift_box)
-                    if best_drift_box is not None
-                    else None
-                )
-                previous_drift = drift_state["drifted"]
-                drift_state = update_drift(drift_state, drift_iou)
-                if drift_state["drifted"] and not previous_drift:
-                    banner = "Bin moved - press C to recalibrate"
-                    banner_until = float("inf")
-                    record_event("drift_detected", frame_info, drop_zone, active_user)
-                    drop_tracks.clear()
-                    recent_above_detections.clear()
-                next_drift_check = loop_time + DRIFT_CHECK_SECONDS
-
             if sensor is not None:
                 for sensor_event in sensor.drain_events():
                     if sensor_event.active:
@@ -1268,7 +1307,7 @@ def run_session(
                             active_user,
                         )
 
-            if active_user and not no_face:
+            if active_user:
                 user_points = get_user_points(active_user)
 
             identified = status.startswith("Identified:")
@@ -1371,7 +1410,6 @@ def run_session(
                         camera,
                         calibration_frame,
                         calibrated_box,
-                        no_confirm=no_confirm,
                         frame_provider=read_next_frame,
                     )
                 calibrated_box = target_bin["box"]
@@ -1383,7 +1421,6 @@ def run_session(
                 zone_activity_recorded = False
                 frame = calibration_frame
                 frame_info = calibration_info or frame_info
-                next_drift_check = time.monotonic() + DRIFT_CHECK_SECONDS
                 if recorder is not None:
                     metadata_path = recorder.directory / "session.json"
                     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -1700,8 +1737,9 @@ def show_registration_window():
         content,
         text=(
             "Pretrained mode uses YOLO-World for recyclables and bins. "
-            "Fine-tuned mode calibrates a bin at startup; comparison asks you "
-            "to select one. The default locked zone is calibrated once. "
+            "The locked workflow detects and confirms one bin at startup, then "
+            "follows that bin frame by frame. If tracking is lost, press C to "
+            "recalibrate. A registered face is required for points. "
             f"Fine-tuned weights: {FINE_TUNED_BIN_MODEL_PATH}"
         ),
         wraplength=430,
@@ -1743,6 +1781,19 @@ def show_registration_window():
 
     def continue_to_recognition():
         nonlocal selected_model, start_requested
+        try:
+            if not load_embeddings():
+                messagebox.showerror(
+                    "Face registration required",
+                    "Register at least one person before starting.",
+                    parent=root,
+                )
+                return
+        except RuntimeError as error:
+            messagebox.showerror(
+                "Could not load registered faces", str(error), parent=root
+            )
+            return
         if (
             model_choice.get() in {MODEL_FINE_TUNED, MODEL_COMPARE}
             and not FINE_TUNED_BIN_MODEL_PATH.is_file()
@@ -1770,11 +1821,6 @@ def show_registration_window():
 def main():
     parser = argparse.ArgumentParser(description="Recognize registered users by webcam")
     parser.add_argument("--add-user", nargs=2, metavar=("NAME", "IMAGE"))
-    parser.add_argument(
-        "--zone-mode",
-        choices=(ZONE_LOCK, ZONE_DETECT, ZONE_FIXED),
-        default=ZONE_LOCK,
-    )
     parser.add_argument("--record", nargs="?", const="sessions", metavar="DIR")
     parser.add_argument(
         "--max-storage-gb", type=float, default=DEFAULT_MAX_STORAGE_GB
@@ -1782,8 +1828,6 @@ def main():
     parser.add_argument("--no-blur", action="store_true")
     parser.add_argument("--sensor", help="mock or serial:PORT")
     parser.add_argument("--video", help="Read a video file instead of the webcam")
-    parser.add_argument("--no-face", action="store_true")
-    parser.add_argument("--no-confirm", action="store_true")
     args = parser.parse_args()
 
     try:
@@ -1805,31 +1849,19 @@ def main():
 
             if args.video:
                 model_choice = MODEL_FINE_TUNED
-            elif args.no_face:
-                model_choice = MODEL_OLD
             else:
                 model_choice = show_registration_window()
 
             if model_choice == MODEL_COMPARE:
-                if (
-                    args.record
-                    or args.sensor
-                    or args.no_face
-                    or args.no_blur
-                    or args.zone_mode != ZONE_LOCK
-                    or args.no_confirm
-                ):
+                if args.record or args.sensor or args.no_blur:
                     parser.error(
-                        "Recording, sensors, face disabling, and zone-mode "
-                        "options are not supported in comparison mode"
+                        "Recording, sensor, and blur options are not supported "
+                        "in comparison mode"
                     )
                 run_model_comparison_webcam()
             elif model_choice in {MODEL_OLD, MODEL_FINE_TUNED}:
                 run_session(
                     model_choice,
-                    zone_mode=args.zone_mode,
-                    no_confirm=args.no_confirm,
-                    no_face=args.no_face,
                     video_path=args.video,
                     record_directory=args.record,
                     max_storage_bytes=int(args.max_storage_gb * 1024**3),

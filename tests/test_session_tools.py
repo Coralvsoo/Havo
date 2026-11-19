@@ -167,10 +167,9 @@ class ReplayTests(unittest.TestCase):
             "calibration_boxes": [],
             "calibration_count": 0,
             "drift": {"bad_checks": 0, "drifted": False},
-            "next_drift_check": 5.0,
         }
 
-    def test_lock_replay_runs_bin_inference_only_for_calibration(self):
+    def test_lock_replay_rechecks_bin_after_calibration(self):
         state = self.new_state()
         bin_detection = {
             "box": (2, 2, 20, 20),
@@ -204,7 +203,7 @@ class ReplayTests(unittest.TestCase):
                     fixed_bin_box=bin_detection["box"],
                 )
 
-        self.assertEqual(detect_bins.call_count, 3)
+        self.assertEqual(detect_bins.call_count, 5)
         self.assertEqual(detect_items.call_count, 3)
 
     def test_detect_and_fixed_replay_use_expected_detector_cadence(self):

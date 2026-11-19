@@ -4,14 +4,16 @@ Webcam app that recognizes registered users, detects recyclable items and bins,
 and awards points when a recyclable is dropped in the configured drop zone.
 User face embeddings and points are stored in a local SQLite database.
 
-The webcam app recognizes registered faces and recyclable items. Its default
-`lock` zone mode calibrates a bin at startup and keeps the drop zone fixed;
-`detect` follows a bin detector on every frame, while `fixed` asks you to
-manually select the target bin. Points are based on a recyclable moving into
-the on-screen drop zone and then either settling or disappearing for four
-consecutive frames. The zone extends from 0.20 bin heights above the bin's top
-to 0.40 bin heights below it, with a 5% side inset. This is not independent
-proof that the item physically landed in the bin.
+The webcam app requires registered-face recognition and recyclable detection.
+Its `lock` workflow proposes a bin at startup, asks you to accept it or redraw
+the rectangle, then follows that same bin with detections on each frame. If the
+bin cannot be matched for three consecutive frames, point awards pause until
+you press C to recalibrate. A manually drawn bin rectangle remains the target.
+Points are based on a recyclable moving into the on-screen drop zone and then
+either settling or disappearing for four consecutive frames. The zone extends
+from 0.20 bin heights above the bin's top to 0.40 bin heights below it, with a
+5% side inset. The camera event is not independent proof that the item
+physically landed in the bin.
 
 ## Requirements
 
@@ -55,21 +57,21 @@ register a user from a local image:
 python face.py --add-user Name path\to\face.jpg
 ```
 
-In default `lock` mode, the app samples 30 frames, accepts a stable bin
-detection, and asks you to confirm the proposed box. Press Enter or Space to
-accept, R to redraw, or Esc to select manually. If automatic calibration is
-unstable or misses the bin, select it manually. The zone then stays fixed while
-the bin is covered; after repeated drift checks, the app pauses point awards
-until you press C to recalibrate. `detect` recalculates the zone from the bin
-detection every frame. `fixed` manually selects a bin once and does not run the
-bin detector during the session.
+The app samples 30 frames to find a stable bin and asks you to confirm the
+proposed rectangle. Press Enter or Space to accept it, R to redraw, or Esc to
+select the bin manually. The detector then follows the accepted bin and updates
+the drop zone as its box moves. If it cannot match the bin for three
+consecutive frames, the app pauses point awards until you press C to
+recalibrate. A manually selected rectangle stays fixed.
 
-Run with a video file, skip face recognition, or turn on session recording:
+Face recognition is required for points. A confirmed drop is assigned only to
+a registered user identified near the action; otherwise it is recorded without
+awarding points. Video input and session recording are available explicitly:
 
 ```powershell
-python face.py --video path\to\test.mp4 --no-face --no-confirm
+python face.py --video path\to\test.mp4
 python face.py --record
-python face.py --zone-mode detect --sensor serial:COM3 --record
+python face.py --sensor serial:COM3 --record
 ```
 
 `--record` creates a timestamped folder under `sessions\` with blurred camera

@@ -224,6 +224,17 @@ def replay_segment(
                         if state["locked_box"] is None:
                             state["locked_box"] = fixed_bin_box
                 if state["locked_box"] is not None:
+                    if not calibrating:
+                        bins = face.detect_bins(bin_model, frame)
+                        bin_match = face.match_bin_detection(
+                            bins, state["locked_box"]
+                        )
+                        state["drift"] = face.update_drift(
+                            state["drift"],
+                            1.0 if bin_match is not None else None,
+                        )
+                        if bin_match is not None and not state["drift"]["drifted"]:
+                            state["locked_box"] = bin_match["box"]
                     bin_detection = {
                         "box": state["locked_box"],
                         "label": "calibrated bin",
@@ -257,33 +268,6 @@ def replay_segment(
                 items = face.detect_items(litter_model, frame, drop_zone)
 
             face.mark_detections_in_drop_zone(items, drop_zone)
-            inside_items = [item for item in items if item["inside"]]
-            if (
-                mode == "lock"
-                and state["locked_box"] is not None
-                and not state["drift"]["drifted"]
-                and time_sec >= state["next_drift_check"]
-                and not inside_items
-                and not any(
-                    track["drop_candidate"] for track in state["tracks"].values()
-                )
-            ):
-                drift_bins = face.detect_bins(bin_model, frame)
-                best_box = (
-                    max(drift_bins, key=lambda detection: detection["confidence"])[
-                        "box"
-                    ]
-                    if drift_bins
-                    else None
-                )
-                iou = (
-                    face.box_iou(state["locked_box"], best_box)
-                    if best_box is not None
-                    else None
-                )
-                state["drift"] = face.update_drift(state["drift"], iou)
-                state["next_drift_check"] = time_sec + face.DRIFT_CHECK_SECONDS
-
             if drop_zone is None or (
                 mode == "lock" and state["drift"]["drifted"]
             ):
@@ -322,7 +306,6 @@ def replay_session(session_dir, litter_model, bin_model, mode):
         "calibration_boxes": [],
         "calibration_count": 0,
         "drift": {"bad_checks": 0, "drifted": False},
-        "next_drift_check": face.DRIFT_CHECK_SECONDS,
     }
     frame_timestamps = read_frame_timestamps(session_dir)
     time_base = 0.0

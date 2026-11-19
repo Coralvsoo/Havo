@@ -90,6 +90,29 @@ class FaceDetectionTests(unittest.TestCase):
         )
         self.assertEqual(face.box_iou((0, 0, 0, 0), (0, 0, 0, 0)), 0.0)
 
+    def test_match_bin_detection_follows_the_selected_bin(self):
+        target = {
+            "box": (12, 10, 112, 110),
+            "confidence": 0.6,
+        }
+        unrelated = {
+            "box": (300, 200, 400, 300),
+            "confidence": 0.99,
+        }
+
+        self.assertIs(
+            face.match_bin_detection([unrelated, target], (10, 10, 110, 110)),
+            target,
+        )
+        self.assertIsNone(
+            face.match_bin_detection([unrelated], (10, 10, 110, 110))
+        )
+
+    def test_run_session_requires_a_registered_face(self):
+        with patch.object(face, "load_embeddings", return_value=[]):
+            with self.assertRaisesRegex(RuntimeError, "Face recognition is required"):
+                face.run_session(face.MODEL_OLD)
+
     def test_decide_calibration_requires_enough_stable_boxes(self):
         stable_boxes = [(10 + index % 2, 10, 110 + index % 2, 110) for index in range(24)]
         calibrated_box, reason = face.decide_calibration(stable_boxes)
@@ -126,9 +149,7 @@ class FaceDetectionTests(unittest.TestCase):
         camera = MagicMock()
         camera.read.return_value = (True, frame)
         bin_model = MagicMock(
-            return_value=[
-                FakeResult([FakeBox(0, 0.9, (5, 5, 30, 30))])
-            ]
+            return_value=[FakeResult([FakeBox(0, 0.9, (5, 5, 30, 30))])]
         )
         bin_model.return_value[0].names = {0: "bin"}
 
@@ -142,19 +163,27 @@ class FaceDetectionTests(unittest.TestCase):
         self.assertEqual(reason, "ok")
         self.assertEqual(bin_model.call_count, 3)
 
-    def test_lock_mode_uses_bin_detector_only_for_calibration(self):
+    def test_lock_mode_tracks_bin_after_calibration(self):
         frame = np.zeros((40, 60, 3), dtype=np.uint8)
         camera = MagicMock()
         camera.isOpened.return_value = True
         camera.get.return_value = 30.0
         camera.read.side_effect = [(True, frame.copy()) for _ in range(3)]
         item_model = MagicMock()
+
+        def bin_result(box):
+            result = FakeResult([FakeBox(0, 0.9, box)])
+            result.names = {0: "bin"}
+            return [result]
+
         bin_model = MagicMock(
-            return_value=[
-                FakeResult([FakeBox(0, 0.9, (5, 5, 30, 30))])
+            side_effect=[
+                bin_result((5, 5, 30, 30)),
+                bin_result((5, 5, 30, 30)),
+                bin_result((5, 5, 30, 30)),
+                bin_result((7, 5, 32, 30)),
             ]
         )
-        bin_model.return_value[0].names = {0: "bin"}
 
         with patch.object(
             face, "CALIBRATION_FRAMES", 3
@@ -163,19 +192,35 @@ class FaceDetectionTests(unittest.TestCase):
         ), patch.object(
             face, "load_litter_models", return_value=(item_model, bin_model)
         ), patch.object(
+            face, "load_embeddings", return_value=[("Alice", np.array([1.0]))]
+        ), patch.object(
             face.cv2, "VideoCapture", return_value=camera
         ), patch.object(
-            face, "detect_items", return_value=[]
+            face,
+            "confirm_bin",
+            return_value={
+                "box": (5, 5, 30, 30),
+                "label": "calibrated bin",
+                "confidence": 1.0,
+                "kind": "bin",
+                "center": (17, 17),
+                "inside": False,
+            },
         ), patch.object(
+            face, "detect_items", return_value=[]
+        ) as detect_items, patch.object(
             face.cv2, "imshow"
         ), patch.object(
             face.cv2, "waitKey", return_value=ord("q")
         ), patch.object(
             face.cv2, "destroyAllWindows"
         ):
-            face.run_session(face.MODEL_FINE_TUNED, no_face=True, no_confirm=True)
+            face.run_session(face.MODEL_FINE_TUNED)
 
-        self.assertEqual(bin_model.call_count, 3)
+        self.assertEqual(bin_model.call_count, 4)
+        self.assertEqual(
+            detect_items.call_args.args[2], (8, 0, 30, 15)
+        )
 
     def test_recorded_session_saves_confirmed_drop_event(self):
         frame = np.zeros((40, 60, 3), dtype=np.uint8)
@@ -216,6 +261,8 @@ class FaceDetectionTests(unittest.TestCase):
             with patch.object(
                 face, "load_litter_models", return_value=(MagicMock(), None)
             ), patch.object(
+                face, "load_embeddings", return_value=[("Alice", np.array([1.0]))]
+            ), patch.object(
                 face.cv2, "VideoCapture", return_value=camera
             ), patch.object(
                 face, "select_target_bin", return_value=target_bin
@@ -233,7 +280,6 @@ class FaceDetectionTests(unittest.TestCase):
                 session_directory = face.run_session(
                     face.MODEL_OLD,
                     zone_mode=face.ZONE_FIXED,
-                    no_face=True,
                     record_directory=temporary_directory,
                     blur=False,
                 )
@@ -279,6 +325,8 @@ class FaceDetectionTests(unittest.TestCase):
             with patch.object(
                 face, "load_litter_models", return_value=(MagicMock(), None)
             ), patch.object(
+                face, "load_embeddings", return_value=[("Alice", np.array([1.0]))]
+            ), patch.object(
                 face.cv2, "VideoCapture", return_value=camera
             ), patch.object(
                 face, "select_target_bin", return_value=target_bin
@@ -296,7 +344,6 @@ class FaceDetectionTests(unittest.TestCase):
                 session_directory = face.run_session(
                     face.MODEL_OLD,
                     zone_mode=face.ZONE_FIXED,
-                    no_face=True,
                     record_directory=temporary_directory,
                     blur=False,
                     sensor=SingleEventSensor(),
