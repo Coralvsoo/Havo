@@ -23,3 +23,7 @@ deepface/
 .env
 .env.*
 *.log
+
+# Local session and annotated-screen recordings
+sessions/
+screen_recordings/

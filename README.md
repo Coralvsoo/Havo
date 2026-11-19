@@ -72,7 +72,14 @@ awarding points. Video input and session recording are available explicitly:
 python face.py --video path\to\test.mp4
 python face.py --record
 python face.py --sensor serial:COM3 --record
+python face.py --record-screen
 ```
+
+Screen recording also starts and stops with V during a session. It saves the
+annotated application view and an event-time CSV under `screen_recordings\` by
+default; `--record-screen DIR` selects another directory. Unlike `--record`,
+the screen recording includes the visible face and identity overlay, so use it
+only with the people's consent.
 
 `--record` creates a timestamped folder under `sessions\` with blurred camera
 segments, event clips and CSV/JSON metadata. Face blurring is enabled unless

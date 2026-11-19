@@ -22,6 +22,7 @@ from deepface import DeepFace
 from hardware.esp32_serial import SerialSensorSource
 from hardware.mock_sensor import MockSensorSource
 from session_recording import SessionRecorder
+from screen_recording import ScreenRecorder, draw_recording_indicator
 
 
 DATABASE_PATH = Path(
@@ -974,10 +975,16 @@ def run_session(
     zone_mode=ZONE_LOCK,
     video_path=None,
     record_directory=None,
+    screen_record_directory=None,
     max_storage_bytes=int(DEFAULT_MAX_STORAGE_GB * 1024**3),
     blur=True,
     sensor=None,
 ):
+    """Run a live (or video-file) session.
+
+    Screen recording is opt-in. Pass a directory to start it automatically;
+    otherwise press V during the session to toggle recording.
+    """
     if zone_mode not in {ZONE_LOCK, ZONE_DETECT, ZONE_FIXED}:
         raise ValueError(f"Unknown zone mode: {zone_mode}")
     known_embeddings = load_embeddings()
@@ -1005,6 +1012,11 @@ def run_session(
     frame_count = 0
     calibrated_box = None
     drop_zone = None
+    screen_recorder = ScreenRecorder(
+        screen_record_directory or "screen_recordings",
+        "yolo-world" if model_choice == MODEL_OLD else "fine-tuned",
+    )
+    screen_autostart_pending = screen_record_directory is not None
 
     try:
         if sensor is not None:
@@ -1284,6 +1296,7 @@ def run_session(
                     )
                 if drop_ready:
                     detected_drop_times.append(frame_info["time_sec"])
+                    screen_recorder.log_event("drop_detected", active_user)
                     record_event(
                         "drop_detected",
                         frame_info,
@@ -1301,6 +1314,9 @@ def run_session(
                         and loop_time - last_award_time >= DROP_COOLDOWN_SECONDS
                     ):
                         user_points = award_points(active_user)
+                        screen_recorder.log_event(
+                            "points_awarded", active_user, f"total={user_points}"
+                        )
                         banner = "RECYCLABLE DROPPED: +10 Points Awarded!"
                         banner_until = loop_time + 3.0
                         last_award_time = loop_time
@@ -1395,18 +1411,29 @@ def run_session(
                 )
             cv2.putText(
                 display_frame,
-                "Press Q or Esc to quit",
+                "Q/Esc: quit | V: start/stop screen recording",
                 (20, 75),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
                 (255, 255, 255),
                 1,
             )
+            if screen_autostart_pending:
+                screen_autostart_pending = False
+                screen_recorder.start(display_frame.shape[1::-1])
+                print(f"Screen recording started: {screen_recorder.video_path}")
+            screen_recorder.add_frame(display_frame)
+            draw_recording_indicator(display_frame, screen_recorder)
             cv2.imshow("Face recognition", display_frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
+            if key in (ord("v"), ord("V")):
+                if screen_recorder.toggle(display_frame.shape[1::-1]):
+                    print(f"Screen recording started: {screen_recorder.video_path}")
+                else:
+                    print(f"Screen recording saved: {screen_recorder.video_path}")
             if key in (ord("c"), ord("C")) and zone_mode == ZONE_LOCK:
                 try:
                     calibrated_box, reason, calibration_frame, calibration_info = calibrate_bin(
@@ -1458,6 +1485,9 @@ def run_session(
                 break
             frame, frame_info = next_frame
     finally:
+        saved_screen_video = screen_recorder.stop()
+        if saved_screen_video is not None:
+            print(f"Screen recording saved: {saved_screen_video}")
         camera.release()
         cv2.destroyAllWindows()
         if sensor_started:
@@ -1848,6 +1878,13 @@ def main():
     parser.add_argument("--no-blur", action="store_true")
     parser.add_argument("--sensor", help="mock or serial:PORT")
     parser.add_argument("--video", help="Read a video file instead of the webcam")
+    parser.add_argument(
+        "--record-screen",
+        nargs="?",
+        const="screen_recordings",
+        metavar="DIR",
+        help="Record the annotated window from the start (V toggles during the session)",
+    )
     args = parser.parse_args()
 
     try:
@@ -1873,10 +1910,15 @@ def main():
                 model_choice = show_registration_window()
 
             if model_choice == MODEL_COMPARE:
-                if args.record or args.sensor or args.no_blur:
+                if (
+                    args.record
+                    or args.record_screen
+                    or args.sensor
+                    or args.no_blur
+                ):
                     parser.error(
-                        "Recording, sensor, and blur options are not supported "
-                        "in comparison mode"
+                        "Recording, screen recording, sensor, and blur options "
+                        "are not supported in comparison mode"
                     )
                 run_model_comparison_webcam()
             elif model_choice in {MODEL_OLD, MODEL_FINE_TUNED}:
@@ -1884,6 +1926,7 @@ def main():
                     model_choice,
                     video_path=args.video,
                     record_directory=args.record,
+                    screen_record_directory=args.record_screen,
                     max_storage_bytes=int(args.max_storage_gb * 1024**3),
                     blur=not args.no_blur,
                     sensor=sensor,
